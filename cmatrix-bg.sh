@@ -56,9 +56,16 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
-for bin in xterm alacritty wmctrl xdotool xev cmatrix; do
+for bin in xterm alacritty wmctrl xdotool xev cmatrix xrandr; do
     command -v "$bin" >/dev/null || { echo "Falta '$bin'. Instalalo con: sudo apt install $bin" >&2; exit 1; }
 done
+
+# Tamaño real del escritorio virtual (todos los monitores combinados, origen
+# 0,0). "xdotool getdisplaygeometry" en un setup multi-monitor devuelve el
+# tamaño de UN solo monitor (no el total), lo que hacía que el clamp de
+# pantalla de más abajo se disparara sobre ventanas que estaban perfectamente
+# adentro. Se calcula una sola vez: no cambia mientras corre el script.
+read -r SCREEN_W SCREEN_H < <(xrandr --query | awk '/^Screen/{gsub(",","",$10); print $8, $10}')
 
 # Ventana de atrás: cmatrix puro en xterm (X11 nativo).
 xterm -title "$BACK_TITLE" -bg black -fg green -geometry "+$((START_X-OFFSET_X))+$((START_Y-OFFSET_Y))" -e cmatrix &
@@ -102,6 +109,14 @@ wmctrl -i -r "$BACK_WID" -b add,skip_taskbar,skip_pager 2>/dev/null
 xprop -id "$BACK_WID" -f _NET_WM_WINDOW_TYPE 32a \
     -set _NET_WM_WINDOW_TYPE _NET_WM_WINDOW_TYPE_UTILITY 2>/dev/null
 
+# Fijar el par "siempre arriba" en vez de perseguir foco/stacking a mano:
+# tratar de subirlas cuando se enfocan y bajarlas cuando no, peleaba contra
+# Mutter (el tipo UTILITY ya las trataba como flotantes) y nunca era
+# confiable. _NET_WM_STATE_ABOVE es el mismo mecanismo que usa cualquier
+# app con "mantener siempre visible", y el WM lo respeta siempre.
+wmctrl -i -r "$BACK_WID" -b add,above 2>/dev/null
+wmctrl -i -r "$FRONT_WID" -b add,above 2>/dev/null
+
 # xterm redondea su tamaño a la grilla de caracteres (resize increment) y
 # siempre redondea hacia abajo, lo que deja un borde fino sin cmatrix.
 # Le sumamos ese margen para que la de atrás siempre quede igual o más
@@ -127,7 +142,7 @@ fi
 # Reubica la de atrás según la geometría actual de la de adelante y el flag
 # de maximizado cacheado (evita forkear xprop en cada evento de movimiento).
 reposition() {
-    local GEO OX OY MAXIMIZED
+    local GEO OX OY MAXIMIZED BX BY BW BH
     GEO="$(xdotool getwindowgeometry --shell "$FRONT_WID" 2>/dev/null)" || return 1
     eval "$GEO"
     read -r MAXIMIZED < "$MAX_FLAG"
@@ -140,39 +155,29 @@ reposition() {
     else
         OX=$OFFSET_X; OY=$OFFSET_Y
     fi
-    wmctrl -i -r "$BACK_WID" -e "0,$((X-OX)),$((Y-OY)),$((WIDTH+PAD_W)),$((HEIGHT+PAD_H))"
-}
 
-# ¿La de atrás ya está justo debajo de la de adelante en el orden de apilado?
-back_is_right_below_front() {
-    local ids tok prev=""
-    ids="$(xprop -root _NET_CLIENT_LIST_STACKING 2>/dev/null)"
-    ids="${ids#*# }"
-    for tok in ${ids//,/ }; do
-        tok=$((tok))
-        [[ "$prev" == "$BACK_WID" && "$tok" == "$FRONT_WID" ]] && return 0
-        prev=$tok
-    done
-    return 1
-}
-
-# Cuando la de adelante se enfoca, la sube junto con la de atrás por encima
-# de lo que sea que las tapara. "xdotool windowraise" no sirve: Mutter ignora
-# los raise de una ventana sin foco (anti robo-de-foco); en cambio "activar"
-# (wmctrl -a, lo mismo que hace un click real) sí lo respeta. Solo lo hacemos
-# si hace falta, porque activar genera un FocusIn nuevo y si no filtráramos
-# por el chequeo de arriba, se dispararía en bucle contra sí mismo.
-raise_pair_if_needed() {
-    back_is_right_below_front && return
-    wmctrl -i -a "$BACK_WID" 2>/dev/null
-    wmctrl -i -a "$FRONT_WID" 2>/dev/null
+    # Mutter ignora los pedidos de mover la ventana de adelante estando
+    # enfocada (probado: wmctrl -e no le hace nada), así que no podemos
+    # impedir que el usuario la arrastre fuera de pantalla. Lo único que
+    # controlamos es la de atrás: la encajamos para que nunca dibuje fuera
+    # del escritorio virtual (SCREEN_W/SCREEN_H, calculados una sola vez al
+    # inicio), aunque la de adelante esté parcialmente afuera.
+    BW=$((WIDTH+PAD_W)); BH=$((HEIGHT+PAD_H))
+    BX=$((X-OX)); BY=$((Y-OY))
+    (( BX < 0 )) && BX=0
+    (( BY < 0 )) && BY=0
+    (( BX + BW > SCREEN_W )) && BX=$((SCREEN_W - BW))
+    (( BY + BH > SCREEN_H )) && BY=$((SCREEN_H - BH))
+    wmctrl -i -r "$BACK_WID" -e "0,$BX,$BY,$BW,$BH"
 }
 
 reposition
-raise_pair_if_needed
 
-# Escucha en paralelo los cambios reales de _NET_WM_STATE (maximizar/restaurar)
-# y solo entonces actualiza el flag cacheado; se queda bloqueado el resto del tiempo.
+# Escucha en paralelo los cambios reales de _NET_WM_STATE (maximizar/restaurar
+# Y minimizar/restaurar: bajo Wayland+XWayland el minimizado no siempre manda
+# UnmapNotify, pero el atom _NET_WM_STATE_HIDDEN sí cambia siempre, así que es
+# la señal confiable para ocultar/mostrar la de atrás. Se queda bloqueado el
+# resto del tiempo.
 mkfifo "$SPY_FIFO"
 xprop -spy -id "$FRONT_WID" _NET_WM_STATE > "$SPY_FIFO" 2>/dev/null &
 SPY_SRC_PID=$!
@@ -182,25 +187,28 @@ while read -r line; do
     else
         echo 0 > "$MAX_FLAG"
     fi
+    if [[ "$line" == *HIDDEN* ]]; then
+        xdotool windowunmap "$BACK_WID" 2>/dev/null
+    else
+        xdotool windowmap "$BACK_WID" 2>/dev/null
+        wmctrl -i -r "$BACK_WID" -b add,above 2>/dev/null
+        wmctrl -i -r "$FRONT_WID" -b add,above 2>/dev/null
+        reposition
+    fi
 done < "$SPY_FIFO" &
 SPY_PID=$!
 
 # En vez de sondear en un bucle, escuchamos los eventos X11 de la ventana de
-# adelante (mover/redimensionar/minimizar/restaurar) y solo actuamos cuando
-# realmente ocurren, así el script queda en reposo (0% CPU) el resto del tiempo.
+# adelante (mover/redimensionar) y solo actuamos cuando realmente ocurren, así
+# el script queda en reposo (0% CPU) el resto del tiempo. Minimizar/restaurar
+# ya lo cubre el spy de _NET_WM_STATE de arriba; el "siempre arriba" ya lo
+# cubre el estado ABOVE fijado al inicio, sin necesidad de escuchar el foco.
 mkfifo "$XEV_FIFO"
 xev -id "$FRONT_WID" > "$XEV_FIFO" 2>/dev/null &
 XEV_PID=$!
 while read -r line; do
     case "$line" in
         *ConfigureNotify*) reposition ;;
-        *UnmapNotify*) xdotool windowunmap "$BACK_WID" 2>/dev/null ;;
-        *MapNotify*)
-            xdotool windowmap "$BACK_WID" 2>/dev/null
-            reposition
-            raise_pair_if_needed
-            ;;
-        *FocusIn*) raise_pair_if_needed ;;
     esac
 done < "$XEV_FIFO" &
 EVENT_PID=$!
